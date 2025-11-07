@@ -316,12 +316,13 @@ def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, ti
         
         del video, LQ
         clean_vram()
-        
+
+    final_output = final_output.to('cpu', dtype=torch.float32)  
     log("[FlashVSR] Done.", message_type='info')
     if frames.shape[0] == 1:
-        final_output = final_output.to(_device)
-        stacked_image_tensor = torch.median(final_output, dim=0).values.unsqueeze(0).float().to('cpu')
-        del final_output
+        final_output_gpu = final_output.to(_device)
+        stacked_image_tensor = torch.median(final_output_gpu, dim=0).values.unsqueeze(0).float().to('cpu')
+        del final_output_gpu
         clean_vram()
         return stacked_image_tensor
     
