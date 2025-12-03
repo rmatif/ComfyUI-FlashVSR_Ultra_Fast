@@ -250,49 +250,74 @@ def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, ti
     add = next_8n5(frames.shape[0]) - frames.shape[0]
     padding_frames = frames[-1:, :, :, :].repeat(add, 1, 1, 1)
     _frames = torch.cat([frames, padding_frames], dim=0)
-        
+
     if tiled_dit:
         N, H, W, C = _frames.shape
-        
+
+        multiple = 128
+        actual_out_H = max(multiple, ((H * scale) // multiple) * multiple)
+        actual_out_W = max(multiple, ((W * scale) // multiple) * multiple)
+        tile_out_size = max(multiple, ((tile_size * scale) // multiple) * multiple)
+        crop_offset = (tile_size * scale - tile_out_size) // 2
+        pad_size = crop_offset // scale
+
+        if pad_size > 0:
+            _frames_padded = torch.nn.functional.pad(_frames.permute(0, 3, 1, 2), (pad_size, pad_size, pad_size, pad_size), mode='reflect').permute(0, 2, 3, 1)
+            H_pad, W_pad = H + 2 * pad_size, W + 2 * pad_size
+        else:
+            _frames_padded = _frames
+            H_pad, W_pad = H, W
+
         final_output_canvas = torch.zeros(
-            (N, H * scale, W * scale, C), 
-            dtype=torch.float16, 
+            (N, actual_out_H, actual_out_W, C),
+            dtype=torch.float16,
             device="cpu"
         )
         weight_sum_canvas = torch.zeros_like(final_output_canvas)
-        tile_coords = calculate_tile_coords(H, W, tile_size, tile_overlap)
+        tile_coords = calculate_tile_coords(H_pad, W_pad, tile_size, tile_overlap)
         latent_tiles_cpu = []
-        
+
         for i, (x1, y1, x2, y2) in enumerate(cqdm(tile_coords, desc="Processing Tiles")):
             log(f"[FlashVSR] Processing tile {i+1}/{len(tile_coords)}: coords ({x1},{y1}) to ({x2},{y2})", message_type='info')
-            input_tile = _frames[:, y1:y2, x1:x2, :]
-            
+            input_tile = _frames_padded[:, y1:y2, x1:x2, :]
+
             LQ_tile, th, tw, F = prepare_input_tensor(input_tile, _device, scale=scale, dtype=dtype)
             if not isinstance(pipe, FlashVSRTinyLongPipeline):
                 LQ_tile = LQ_tile.to(_device)
-                
+
             output_tile_gpu = pipe(
                 prompt="", negative_prompt="", cfg_scale=1.0, num_inference_steps=1, seed=seed, tiled=tiled_vae,
                 LQ_video=LQ_tile, num_frames=F, height=th, width=tw, is_full_block=False, if_buffer=True,
                 topk_ratio=sparse_ratio*768*1280/(th*tw), kv_ratio=kv_ratio, local_range=local_range,
                 color_fix=color_fix, unload_dit=unload_dit, force_offload=force_offload
             )
-            
+
             processed_tile_cpu = tensor2video(output_tile_gpu).to("cpu")
-            
+
             mask_nchw = create_feather_mask(
                 (processed_tile_cpu.shape[1], processed_tile_cpu.shape[2]),
                 tile_overlap * scale
             ).to("cpu")
             mask_nhwc = mask_nchw.permute(0, 2, 3, 1)
-            out_x1, out_y1 = x1 * scale, y1 * scale
-            
-            tile_H_scaled = processed_tile_cpu.shape[1]
-            tile_W_scaled = processed_tile_cpu.shape[2]
-            out_x2, out_y2 = out_x1 + tile_W_scaled, out_y1 + tile_H_scaled
-            final_output_canvas[:, out_y1:out_y2, out_x1:out_x2, :] += processed_tile_cpu * mask_nhwc
-            weight_sum_canvas[:, out_y1:out_y2, out_x1:out_x2, :] += mask_nhwc
-            
+
+            out_x1 = x1 * scale
+            out_y1 = y1 * scale
+            out_x2 = out_x1 + tile_out_size
+            out_y2 = out_y1 + tile_out_size
+
+            src_x1 = max(0, -out_x1)
+            src_y1 = max(0, -out_y1)
+            dst_x1 = max(0, out_x1)
+            dst_y1 = max(0, out_y1)
+            dst_x2 = min(actual_out_W, out_x2)
+            dst_y2 = min(actual_out_H, out_y2)
+            copy_w = dst_x2 - dst_x1
+            copy_h = dst_y2 - dst_y1
+
+            if copy_w > 0 and copy_h > 0:
+                final_output_canvas[:, dst_y1:dst_y2, dst_x1:dst_x2, :] += processed_tile_cpu[:, src_y1:src_y1+copy_h, src_x1:src_x1+copy_w, :] * mask_nhwc[:, src_y1:src_y1+copy_h, src_x1:src_x1+copy_w, :]
+                weight_sum_canvas[:, dst_y1:dst_y2, dst_x1:dst_x2, :] += mask_nhwc[:, src_y1:src_y1+copy_h, src_x1:src_x1+copy_w, :]
+
             del LQ_tile, output_tile_gpu, processed_tile_cpu, input_tile
             clean_vram()
             
