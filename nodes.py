@@ -50,33 +50,46 @@ def largest_8n1_leq(n):  # 8n+1
 def next_8n5(n):  # next 8n+5
     return 21 if n < 21 else ((n - 5 + 7) // 8) * 8 + 5
 
+def ceil_to_multiple(value: int, multiple: int) -> int:
+    return ((value + multiple - 1) // multiple) * multiple
+
 def compute_scaled_and_target_dims(w0: int, h0: int, scale: int = 4, multiple: int = 128):
     if w0 <= 0 or h0 <= 0:
         raise ValueError("invalid original size")
 
     sW, sH = w0 * scale, h0 * scale
-    tW = max(multiple, (sW // multiple) * multiple)
-    tH = max(multiple, (sH // multiple) * multiple)
+    tW = max(multiple, ceil_to_multiple(sW, multiple))
+    tH = max(multiple, ceil_to_multiple(sH, multiple))
     return sW, sH, tW, tH
 
-def tensor_upscale_then_center_crop(frame_tensor: torch.Tensor, scale: int, tW: int, tH: int) -> torch.Tensor:
-    h0, w0, c = frame_tensor.shape
-    tensor_bchw = frame_tensor.permute(2, 0, 1).unsqueeze(0) # HWC -> CHW -> BCHW
-    
-    sW, sH = w0 * scale, h0 * scale
-    upscaled_tensor = F.interpolate(tensor_bchw, size=(sH, sW), mode='bicubic', align_corners=False)
-    
-    l = max(0, (sW - tW) // 2)
-    t = max(0, (sH - tH) // 2)
-    cropped_tensor = upscaled_tensor[:, :, t:t + tH, l:l + tW]
+def compute_center_padding(sW: int, sH: int, tW: int, tH: int):
+    pad_w = max(0, tW - sW)
+    pad_h = max(0, tH - sH)
+    pad_left = pad_w // 2
+    pad_right = pad_w - pad_left
+    pad_top = pad_h // 2
+    pad_bottom = pad_h - pad_top
+    return pad_top, pad_bottom, pad_left, pad_right
 
-    return cropped_tensor.squeeze(0)
+def tensor_upscale_then_center_pad(frame_tensor: torch.Tensor, scale: int, sW: int, sH: int, pad) -> torch.Tensor:
+    tensor_bchw = frame_tensor.permute(2, 0, 1).unsqueeze(0) # HWC -> CHW -> BCHW
+    upscaled_tensor = F.interpolate(tensor_bchw, size=(sH, sW), mode='bicubic', align_corners=False)
+
+    pad_top, pad_bottom, pad_left, pad_right = pad
+    if pad_top or pad_bottom or pad_left or pad_right:
+        pad_mode = "reflect"
+        if pad_left >= sW or pad_right >= sW or pad_top >= sH or pad_bottom >= sH:
+            pad_mode = "replicate"
+        upscaled_tensor = F.pad(upscaled_tensor, (pad_left, pad_right, pad_top, pad_bottom), mode=pad_mode)
+
+    return upscaled_tensor.squeeze(0)
 
 def prepare_input_tensor(image_tensor: torch.Tensor, device, scale: int = 4, dtype=torch.bfloat16):
     N0, h0, w0, _ = image_tensor.shape
     
     multiple = 128
     sW, sH, tW, tH = compute_scaled_and_target_dims(w0, h0, scale=scale, multiple=multiple)
+    pad = compute_center_padding(sW, sH, tW, tH)
     num_frames_with_padding = N0 + 4
     F = largest_8n1_leq(num_frames_with_padding)
     
@@ -87,7 +100,7 @@ def prepare_input_tensor(image_tensor: torch.Tensor, device, scale: int = 4, dty
     for i in range(F):
         frame_idx = min(i, N0 - 1)
         frame_slice = image_tensor[frame_idx].to(device)
-        tensor_chw = tensor_upscale_then_center_crop(frame_slice, scale=scale, tW=tW, tH=tH).to('cpu').to(dtype) * 2.0 - 1.0
+        tensor_chw = tensor_upscale_then_center_pad(frame_slice, scale=scale, sW=sW, sH=sH, pad=pad).to('cpu').to(dtype) * 2.0 - 1.0
         frames.append(tensor_chw)
         del frame_slice
 
@@ -97,7 +110,15 @@ def prepare_input_tensor(image_tensor: torch.Tensor, device, scale: int = 4, dty
     del vid_stacked
     clean_vram()
     
-    return vid_final, tH, tW, F
+    return vid_final, tH, tW, F, sH, sW, pad
+
+def crop_video_nhwc(video: torch.Tensor, sH: int, sW: int, pad):
+    if pad is None:
+        return video
+    pad_top, pad_bottom, pad_left, pad_right = pad
+    if pad_top == 0 and pad_bottom == 0 and pad_left == 0 and pad_right == 0:
+        return video
+    return video[:, pad_top:pad_top + sH, pad_left:pad_left + sW, :]
 
 def calculate_tile_coords(height, width, tile_size, overlap):
     coords = []
@@ -253,35 +274,21 @@ def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, ti
 
     if tiled_dit:
         N, H, W, C = _frames.shape
-
-        multiple = 128
-        actual_out_H = max(multiple, ((H * scale) // multiple) * multiple)
-        actual_out_W = max(multiple, ((W * scale) // multiple) * multiple)
-        tile_out_size = max(multiple, ((tile_size * scale) // multiple) * multiple)
-        crop_offset = (tile_size * scale - tile_out_size) // 2
-        pad_size = crop_offset // scale
-
-        if pad_size > 0:
-            _frames_padded = torch.nn.functional.pad(_frames.permute(0, 3, 1, 2), (pad_size, pad_size, pad_size, pad_size), mode='reflect').permute(0, 2, 3, 1)
-            H_pad, W_pad = H + 2 * pad_size, W + 2 * pad_size
-        else:
-            _frames_padded = _frames
-            H_pad, W_pad = H, W
+        out_H, out_W = H * scale, W * scale
 
         final_output_canvas = torch.zeros(
-            (N, actual_out_H, actual_out_W, C),
+            (N, out_H, out_W, C),
             dtype=torch.float16,
             device="cpu"
         )
         weight_sum_canvas = torch.zeros_like(final_output_canvas)
-        tile_coords = calculate_tile_coords(H_pad, W_pad, tile_size, tile_overlap)
-        latent_tiles_cpu = []
+        tile_coords = calculate_tile_coords(H, W, tile_size, tile_overlap)
 
         for i, (x1, y1, x2, y2) in enumerate(cqdm(tile_coords, desc="Processing Tiles")):
             log(f"[FlashVSR] Processing tile {i+1}/{len(tile_coords)}: coords ({x1},{y1}) to ({x2},{y2})", message_type='info')
-            input_tile = _frames_padded[:, y1:y2, x1:x2, :]
+            input_tile = _frames[:, y1:y2, x1:x2, :]
 
-            LQ_tile, th, tw, F = prepare_input_tensor(input_tile, _device, scale=scale, dtype=dtype)
+            LQ_tile, th, tw, F, sH_tile, sW_tile, pad = prepare_input_tensor(input_tile, _device, scale=scale, dtype=dtype)
             if not isinstance(pipe, FlashVSRTinyLongPipeline):
                 LQ_tile = LQ_tile.to(_device)
 
@@ -293,24 +300,26 @@ def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, ti
             )
 
             processed_tile_cpu = tensor2video(output_tile_gpu).to("cpu")
+            processed_tile_cpu = crop_video_nhwc(processed_tile_cpu, sH_tile, sW_tile, pad)
 
+            overlap_px = min(tile_overlap * scale, processed_tile_cpu.shape[1], processed_tile_cpu.shape[2])
             mask_nchw = create_feather_mask(
                 (processed_tile_cpu.shape[1], processed_tile_cpu.shape[2]),
-                tile_overlap * scale
+                overlap_px
             ).to("cpu")
             mask_nhwc = mask_nchw.permute(0, 2, 3, 1)
 
             out_x1 = x1 * scale
             out_y1 = y1 * scale
-            out_x2 = out_x1 + tile_out_size
-            out_y2 = out_y1 + tile_out_size
+            out_x2 = out_x1 + sW_tile
+            out_y2 = out_y1 + sH_tile
 
             src_x1 = max(0, -out_x1)
             src_y1 = max(0, -out_y1)
             dst_x1 = max(0, out_x1)
             dst_y1 = max(0, out_y1)
-            dst_x2 = min(actual_out_W, out_x2)
-            dst_y2 = min(actual_out_H, out_y2)
+            dst_x2 = min(out_W, out_x2)
+            dst_y2 = min(out_H, out_y2)
             copy_w = dst_x2 - dst_x1
             copy_h = dst_y2 - dst_y1
 
@@ -325,7 +334,7 @@ def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, ti
         final_output = final_output_canvas / weight_sum_canvas
     else:
         log("[FlashVSR] Preparing frames...")
-        LQ, th, tw, F = prepare_input_tensor(_frames, _device, scale=scale, dtype=dtype)
+        LQ, th, tw, F, sH, sW, pad = prepare_input_tensor(_frames, _device, scale=scale, dtype=dtype)
         if not isinstance(pipe, FlashVSRTinyLongPipeline):
             LQ = LQ.to(_device)
         log(f"[FlashVSR] Processing {frames.shape[0]} frames...", message_type='info')
@@ -338,6 +347,7 @@ def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, ti
         )
         
         final_output = tensor2video(video).to('cpu')
+        final_output = crop_video_nhwc(final_output, sH, sW, pad)
         
         del video, LQ
         clean_vram()
